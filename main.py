@@ -30,14 +30,17 @@ class PMOConsultantBot(fp.PoeBot):
         """Main response handler with AI intelligence"""
         
         user_id = request.user_id
-        user_message = request.query[-1].content
+        user_message = request.query[-1].content.strip()
         
         # Initialize state if new user
         if user_id not in conversation_states:
             conversation_states[user_id] = {
                 "phase": "intro",
-                "data": {},
-                "conversation_history": []
+                "data": {
+                    "schedule_variance": 0  # Default value
+                },
+                "conversation_history": [],
+                "current_question": None
             }
         
         state = conversation_states[user_id]
@@ -66,50 +69,93 @@ class PMOConsultantBot(fp.PoeBot):
     async def _handle_intro(self, state: dict, message: str) -> str:
         """Handle introduction phase"""
         state["phase"] = "collecting"
-        # Set schedule_variance to 0 by default
-        state["data"]["schedule_variance"] = 0
         return """👋 Hi! I'm your AI-powered PMO consultant. I'll help you create a comprehensive program plan and deliver 5 professional PowerPoint reports to your inbox.
 
-**You can provide information in any way you like:**
-- Answer my questions one by one, OR
-- Give me all the details at once, OR
-- Just chat naturally - I'll figure it out!
+**Let's get started! Tell me about your program.** You can share as much or as little as you want, and I'll ask follow-up questions for anything missing.
 
-**I need to collect information about your program:**
-1. **Program basics**: Name, manager, sponsor
-2. **Timeline**: Start and end dates  
-3. **Budget**: Total budget and amount spent so far
-4. **Status**: Overall status (On Track/At Risk/Off Track) and commentary
-5. **Progress**: Key accomplishments and upcoming milestones
-6. **RAID items**: Risks, Assumptions, Issues, Dependencies
-7. **Your email**: Where to send the reports
+**I need to know:**
+- Program name, manager, sponsor, and your email
+- Budget information
+- Status and progress
+- RAID items (Risks, Assumptions, Issues, Dependencies)
 
-**Let's get started! Tell me about your program.** You can share as much or as little as you want, and I'll ask follow-up questions for anything missing."""
+Go ahead and tell me what you know!"""
+
+    def _extract_simple_data(self, state: dict, message: str):
+        """Extract data using simple pattern matching"""
+        msg_lower = message.lower()
+        data = state["data"]
+        
+        # Extract email
+        email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', message)
+        if email_match and "program_manager_email" not in data:
+            data["program_manager_email"] = email_match.group(0)
+        
+        # Extract numbers for RAID counts when explicitly asked
+        current_q = state.get("current_question", "")
+        
+        # Look for standalone numbers (like "0", "5", "10")
+        number_match = re.search(r'\b(\d+)\b', message)
+        
+        if "risk" in current_q.lower() and number_match:
+            data["open_risks"] = int(number_match.group(1))
+        elif "assumption" in current_q.lower() and number_match:
+            data["open_assumptions"] = int(number_match.group(1))
+        elif "issue" in current_q.lower() and number_match:
+            data["open_issues"] = int(number_match.group(1))
+        elif "dependenc" in current_q.lower() and number_match:
+            data["open_dependencies"] = int(number_match.group(1))
+        
+        # Check for "none", "zero", "no" responses
+        if any(word in msg_lower for word in ["none", "zero", "no ", "0"]):
+            if "risk" in current_q.lower() and "open_risks" not in data:
+                data["open_risks"] = 0
+            if "assumption" in current_q.lower() and "open_assumptions" not in data:
+                data["open_assumptions"] = 0
+            if "issue" in current_q.lower() and "open_issues" not in data:
+                data["open_issues"] = 0
+            if "dependenc" in current_q.lower() and "open_dependencies" not in data:
+                data["open_dependencies"] = 0
+        
+        # Extract budget numbers
+        if "budget" in current_q.lower() or "budget" in msg_lower:
+            # Find all numbers in the message
+            numbers = re.findall(r'\d+(?:,\d{3})*(?:\.\d+)?', message.replace(',', ''))
+            if numbers:
+                # Convert to integers
+                nums = [int(float(n)) for n in numbers]
+                if "total" in msg_lower or "total_budget" not in data:
+                    if len(nums) >= 1 and "total_budget" not in data:
+                        data["total_budget"] = nums[0]
+                    if len(nums) >= 2 and "budget_spent" not in data:
+                        data["budget_spent"] = nums[1]
+        
+        # Extract status
+        if "on track" in msg_lower:
+            data["overall_status"] = "On Track"
+        elif "at risk" in msg_lower:
+            data["overall_status"] = "At Risk"
+        elif "off track" in msg_lower:
+            data["overall_status"] = "Off Track"
 
     async def _handle_collection(self, state: dict, message: str, request: fp.QueryRequest) -> AsyncIterable[fp.PartialResponse]:
-        """Handle data collection phase with AI intelligence using Poe's Claude"""
+        """Handle data collection phase"""
         
-        # Use Poe's Claude to extract information and determine next steps
-        extraction_result = await self._extract_data_with_poe_ai(state, message, request)
+        # First, try to extract data using simple patterns
+        self._extract_simple_data(state, message)
         
-        # Update state with extracted data (only non-null values)
+        # Then use Claude to extract remaining data and ask next question
+        extraction_result = await self._get_claude_help(state, message, request)
+        
+        # Update data from Claude's extraction
         if extraction_result and "extracted_data" in extraction_result:
             for key, value in extraction_result["extracted_data"].items():
-                # Only update if value is meaningful
-                if value and str(value).lower() not in ["unknown", "null", "none", ""]:
-                    # Special handling for numeric fields
-                    if key in ["total_budget", "budget_spent", "open_risks", "open_assumptions", "open_issues", "open_dependencies"]:
-                        try:
-                            # Extract numbers from strings
-                            num_str = re.sub(r'[^\d-]', '', str(value))
-                            if num_str:
-                                state["data"][key] = int(num_str)
-                        except:
-                            pass
-                    else:
+                if value and str(value).lower() not in ["unknown", "null", "none", "", "n/a"]:
+                    # Only update if not already set
+                    if key not in state["data"] or not state["data"][key]:
                         state["data"][key] = value
         
-        # Check if we have everything (schedule_variance is already set to 0)
+        # Check completion
         required_fields = [
             "program_name", "program_manager", "program_manager_email",
             "sponsor_name", "update_date", "update_title",
@@ -121,218 +167,211 @@ class PMOConsultantBot(fp.PoeBot):
         
         missing_fields = [f for f in required_fields if f not in state["data"] or not state["data"][f]]
         
+        print(f"Current data: {json.dumps(state['data'], indent=2)}")
+        print(f"Missing fields: {missing_fields}")
+        
         if not missing_fields:
-            # All data collected - prepare for submission
+            # All data collected
             state["phase"] = "complete"
             response = await self._prepare_submission(state)
             yield fp.PartialResponse(text=response)
         else:
-            # Still need more information
-            next_q = extraction_result.get("next_question", "Could you provide more details about your program?")
+            # Ask next question
+            next_q = extraction_result.get("next_question", "Could you provide more details?")
+            state["current_question"] = next_q
             yield fp.PartialResponse(text=next_q)
 
-    async def _extract_data_with_poe_ai(self, state: dict, message: str, request: fp.QueryRequest) -> dict:
-        """Use Poe's Claude to intelligently extract data and generate next question"""
+    async def _get_claude_help(self, state: dict, message: str, request: fp.QueryRequest) -> dict:
+        """Get Claude's help with extraction and next question"""
         
         current_data = state["data"]
         
-        system_prompt = f"""You are a PMO consultant collecting program information. Extract data from the user's message and ask for what's missing.
+        prompt = f"""You are helping collect program information. 
 
-**Current data collected:**
+**Data we have so far:**
+```json
 {json.dumps(current_data, indent=2)}
+```
 
-**Required fields (extract from user's message if present):**
-- program_name: Name of the program
-- program_manager: Full name of program manager
-- program_manager_email: Email address
-- sponsor_name: Executive sponsor name
-- update_date: Date (YYYY-MM-DD format, use 2024-10-23 if not specified)
-- update_title: Update title (e.g., "Q4 2024 Update")
-- key_accomplishments: Recent achievements
-- upcoming_milestones: Future milestones
-- total_budget: Total budget (integer only, no currency symbols)
-- budget_spent: Amount spent (integer only)
-- overall_status: Must be exactly "On Track", "At Risk", or "Off Track"
-- status_commentary: Status explanation
-- open_risks: Number of open risks (integer, use 0 if "none" or "no risks")
-- open_assumptions: Number of assumptions (integer, use 0 if none)
-- open_issues: Number of issues (integer, use 0 if none)
-- open_dependencies: Number of dependencies (integer, use 0 if none)
+**User just said:** "{message}"
 
-**User's message:** "{message}"
+**Required fields we still need:**
+- program_name, program_manager, program_manager_email, sponsor_name
+- update_date (use 2024-10-23 if not specified), update_title
+- key_accomplishments, upcoming_milestones
+- total_budget, budget_spent (integers only)
+- overall_status ("On Track", "At Risk", or "Off Track")
+- status_commentary
+- open_risks, open_assumptions, open_issues, open_dependencies (integers, 0 if none)
 
 **Your task:**
-1. Extract ANY information from the user's message
-2. Identify what's still missing
-3. Ask a natural follow-up question for missing items
+1. Extract any NEW information from the user's message
+2. Determine what's STILL missing
+3. Generate ONE clear question for the next missing item
 
-**Response format - MUST be valid JSON:**
+**CRITICAL: Respond ONLY with valid JSON in this exact format:**
+```json
 {{
   "extracted_data": {{
     "field_name": "value"
   }},
-  "next_question": "Your follow-up question here"
+  "next_question": "Your question here"
 }}
+```
 
-**Important rules:**
-- For numbers: extract digits only (e.g., "500000" from "$500,000" or "500k")
-- For RAID counts: if user says "none", "no", "zero" → use 0
-- If user says "on track" or "on schedule" → overall_status is "On Track"
-- Be encouraging and conversational
-- Ask for 2-3 related items at once
-- ONLY return valid JSON, no other text
+**Rules:**
+- If user said a number, extract it
+- If user said "none" or "zero", use 0
+- Ask for ONE thing at a time (or 2-3 related items)
+- Be conversational and encouraging
 
-Return JSON now:"""
+Respond with ONLY the JSON, nothing else:"""
 
         try:
-            # Create a combined prompt
-            combined_prompt = f"{system_prompt}"
-            
-            # Get the last user message
             last_msg = request.query[-1]
-            
-            # Create a new message with the prompt
-            new_msg = last_msg.model_copy(update={"content": combined_prompt})
-            
-            # Create a new request
+            new_msg = last_msg.model_copy(update={"content": prompt})
             new_request = request.model_copy(update={"query": [new_msg]})
             
-            # Use Poe's stream_request to call Claude
-            extraction_response = ""
-            async for msg in fp.stream_request(
-                new_request, "Claude-Sonnet-4.5", request.access_key
-            ):
+            response_text = ""
+            async for msg in fp.stream_request(new_request, "Claude-Sonnet-4.5", request.access_key):
                 if isinstance(msg, fp.PartialResponse):
-                    extraction_response += msg.text
+                    response_text += msg.text
             
-            # Clean up the response
-            extraction_response = extraction_response.strip()
-            # Remove markdown code blocks if present
-            if "```json" in extraction_response:
-                extraction_response = extraction_response.split("```json")[1].split("```")[0]
-            elif "```" in extraction_response:
-                extraction_response = extraction_response.split("```")[1].split("```")[0]
-            extraction_response = extraction_response.strip()
+            # Clean response
+            response_text = response_text.strip()
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                parts = response_text.split("```")
+                if len(parts) >= 2:
+                    response_text = parts[1].strip()
             
-            # Try to parse JSON
-            result = json.loads(extraction_response)
+            # Try to find JSON in the response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(0)
+            
+            result = json.loads(response_text)
             return result
             
         except Exception as e:
-            print(f"AI extraction error: {e}")
-            print(f"Response was: {extraction_response if 'extraction_response' in locals() else 'No response'}")
-            # Fallback: ask for basic info
-            return {
-                "extracted_data": {},
-                "next_question": "I had trouble processing that. Could you please provide: your program name, your name as program manager, and your email address?"
-            }
+            print(f"Claude help error: {e}")
+            print(f"Response: {response_text if 'response_text' in locals() else 'none'}")
+            
+            # Fallback: determine next question manually
+            if "program_name" not in current_data:
+                return {"extracted_data": {}, "next_question": "What's the name of your program?"}
+            elif "program_manager" not in current_data:
+                return {"extracted_data": {}, "next_question": "What's your name (as the program manager)?"}
+            elif "program_manager_email" not in current_data:
+                return {"extracted_data": {}, "next_question": "What's your email address?"}
+            elif "sponsor_name" not in current_data:
+                return {"extracted_data": {}, "next_question": "Who is the executive sponsor for this program?"}
+            elif "overall_status" not in current_data:
+                return {"extracted_data": {}, "next_question": "What's the overall program status? (On Track / At Risk / Off Track)"}
+            elif "status_commentary" not in current_data:
+                return {"extracted_data": {}, "next_question": "Can you provide a brief commentary on the program status?"}
+            elif "key_accomplishments" not in current_data:
+                return {"extracted_data": {}, "next_question": "What are the key accomplishments so far?"}
+            elif "upcoming_milestones" not in current_data:
+                return {"extracted_data": {}, "next_question": "What are the upcoming milestones?"}
+            elif "total_budget" not in current_data:
+                return {"extracted_data": {}, "next_question": "What's the total program budget? (just the number)"}
+            elif "budget_spent" not in current_data:
+                return {"extracted_data": {}, "next_question": "How much of the budget has been spent so far?"}
+            elif "open_risks" not in current_data:
+                return {"extracted_data": {}, "next_question": "How many open risks are there? (enter a number, or 0 if none)"}
+            elif "open_issues" not in current_data:
+                return {"extracted_data": {}, "next_question": "How many open issues? (enter a number, or 0 if none)"}
+            elif "open_assumptions" not in current_data:
+                return {"extracted_data": {}, "next_question": "How many assumptions? (enter a number, or 0 if none)"}
+            elif "open_dependencies" not in current_data:
+                return {"extracted_data": {}, "next_question": "How many dependencies? (enter a number, or 0 if none)"}
+            else:
+                return {"extracted_data": {}, "next_question": "Let me review what we have..."}
 
     async def _handle_completion(self, state: dict, message: str) -> str:
-        """Handle completion phase - user wants to start over"""
-        # Reset state
+        """Handle completion phase"""
         state["phase"] = "intro"
-        state["data"] = {}
+        state["data"] = {"schedule_variance": 0}
         state["conversation_history"] = []
         return await self._handle_intro(state, message)
 
     async def _prepare_submission(self, state: dict) -> str:
-        """Prepare data for webhook submission"""
-        
+        """Prepare and submit data"""
         data = state["data"]
         
-        # Prepare webhook payload with all required fields
+        # Set defaults
+        if "update_date" not in data:
+            data["update_date"] = "2024-10-23"
+        if "update_title" not in data:
+            data["update_title"] = "Program Update"
+        
         webhook_data = {
-            "program_name": data.get("program_name", "Unknown Program"),
-            "program_manager": data.get("program_manager", "Unknown Manager"),
+            "program_name": data.get("program_name", "Unknown"),
+            "program_manager": data.get("program_manager", "Unknown"),
             "program_manager_email": data.get("program_manager_email", ""),
-            "sponsor_name": data.get("sponsor_name", "Unknown Sponsor"),
-            "update_date": data.get("update_date", "2024-10-23"),
-            "update_title": data.get("update_title", "Program Update"),
-            "key_accomplishments": data.get("key_accomplishments", "None reported"),
-            "upcoming_milestones": data.get("upcoming_milestones", "None reported"),
-            "total_budget": int(data.get("total_budget", 0)) if str(data.get("total_budget", 0)).replace("-","").isdigit() else 0,
-            "budget_spent": int(data.get("budget_spent", 0)) if str(data.get("budget_spent", 0)).replace("-","").isdigit() else 0,
-            "schedule_variance": 0,  # Always 0 - field removed from collection
+            "sponsor_name": data.get("sponsor_name", "Unknown"),
+            "update_date": data.get("update_date"),
+            "update_title": data.get("update_title"),
+            "key_accomplishments": data.get("key_accomplishments", "None"),
+            "upcoming_milestones": data.get("upcoming_milestones", "None"),
+            "total_budget": int(data.get("total_budget", 0)),
+            "budget_spent": int(data.get("budget_spent", 0)),
+            "schedule_variance": 0,
             "overall_status": data.get("overall_status", "On Track"),
-            "status_commentary": data.get("status_commentary", "No commentary provided"),
+            "status_commentary": data.get("status_commentary", "No commentary"),
             "raid_counts": {
-                "risks": int(data.get("open_risks", 0)) if str(data.get("open_risks", 0)).isdigit() else 0,
-                "assumptions": int(data.get("open_assumptions", 0)) if str(data.get("open_assumptions", 0)).isdigit() else 0,
-                "issues": int(data.get("open_issues", 0)) if str(data.get("open_issues", 0)).isdigit() else 0,
-                "dependencies": int(data.get("open_dependencies", 0)) if str(data.get("open_dependencies", 0)).isdigit() else 0
+                "risks": int(data.get("open_risks", 0)),
+                "assumptions": int(data.get("open_assumptions", 0)),
+                "issues": int(data.get("open_issues", 0)),
+                "dependencies": int(data.get("open_dependencies", 0))
             },
-            "open_risks": int(data.get("open_risks", 0)) if str(data.get("open_risks", 0)).isdigit() else 0,
-            "open_assumptions": int(data.get("open_assumptions", 0)) if str(data.get("open_assumptions", 0)).isdigit() else 0,
-            "open_issues": int(data.get("open_issues", 0)) if str(data.get("open_issues", 0)).isdigit() else 0,
-            "open_dependencies": int(data.get("open_dependencies", 0)) if str(data.get("open_dependencies", 0)).isdigit() else 0
+            "open_risks": int(data.get("open_risks", 0)),
+            "open_assumptions": int(data.get("open_assumptions", 0)),
+            "open_issues": int(data.get("open_issues", 0)),
+            "open_dependencies": int(data.get("open_dependencies", 0))
         }
         
-        # Submit to webhook
         success = await self._submit_to_webhook(webhook_data)
         
         if success:
-            return f"""✅ **Perfect! I have everything I need.**
+            return f"""✅ **Perfect! Submitting your program details now...**
 
-**Submitting your program details now...**
-
-📊 **5 PowerPoint reports are being generated:**
-1. Steering Committee Pack
-2. Program Status Report
-3. RAID Log
-4. Budget Tracking Dashboard
-5. Milestone Tracker
-
-They'll be delivered to **{webhook_data["program_manager_email"]}** within 2-3 minutes.
-
----
+📊 **5 PowerPoint reports are being generated and will be sent to {webhook_data["program_manager_email"]}**
 
 **Program Summary:**
 - **Name**: {webhook_data["program_name"]}
 - **Manager**: {webhook_data["program_manager"]}
-- **Sponsor**: {webhook_data["sponsor_name"]}
 - **Budget**: ${webhook_data["total_budget"]:,} (${webhook_data["budget_spent"]:,} spent)
 - **Status**: {webhook_data["overall_status"]}
 - **RAID**: {webhook_data["open_risks"]} risks, {webhook_data["open_issues"]} issues, {webhook_data["open_assumptions"]} assumptions, {webhook_data["open_dependencies"]} dependencies
 
-Check your inbox! 📧
+Check your inbox in 2-3 minutes! 📧
 
----
-
-Want to create another program? Just say "hello" to start over."""
+Type "hello" to create another program update."""
         else:
-            return f"""❌ **Oops! There was an error submitting to the webhook.**
-
-Please try again or contact support. Here's your data for reference:
-
-```json
-{json.dumps(webhook_data, indent=2)}
-```
-
-Type "hello" to start over."""
+            return "❌ Error submitting to webhook. Please try again or contact support."
 
     async def _submit_to_webhook(self, data: dict) -> bool:
-        """Submit program data to webhook"""
+        """Submit to webhook"""
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(WEBHOOK_URL, json=data)
-                print(f"Webhook response: {response.status_code}")
-                print(f"Webhook response body: {response.text}")
+                print(f"Webhook: {response.status_code} - {response.text}")
                 return response.status_code == 200
         except Exception as e:
-            print(f"Webhook submission error: {e}")
+            print(f"Webhook error: {e}")
             return False
 
     async def get_settings(self, setting: fp.SettingsRequest) -> fp.SettingsResponse:
-        """Configure bot settings"""
+        """Bot settings"""
         return fp.SettingsResponse(
             server_bot_dependencies={"Claude-Sonnet-4.5": 1},
-            introduction_message="👋 Hi! I'm your AI-powered PMO consultant. I'll help you create a comprehensive program plan and deliver 5 professional PowerPoint reports to your inbox. Just say 'hello' to get started!"
+            introduction_message="👋 Hi! I'm your AI PMO consultant. Say 'hello' to create program reports!"
         )
 
 
-# Create the bot instance
 bot = PMOConsultantBot()
-
-# Create FastAPI app
 app = fp.make_app(bot, allow_without_key=True)
 
