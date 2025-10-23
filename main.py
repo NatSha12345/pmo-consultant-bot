@@ -9,7 +9,6 @@ from typing import AsyncIterable
 import fastapi_poe as fp
 import json
 import httpx
-import os
 
 # Webhook endpoint
 WEBHOOK_URL = "https://natsha.pythonanywhere.com/webhook/fortnightly-update-direct"
@@ -62,12 +61,6 @@ class PMOConsultantBot(fp.PoeBot):
             response = "I'm not sure what to do. Let's start over. Type 'hello' to begin."
             state["phase"] = "intro"
             yield fp.PartialResponse(text=response)
-        
-        # Add bot response to history (will be updated after streaming)
-        # state["conversation_history"].append({
-        #     "role": "assistant",
-        #     "content": response
-        # })
 
     async def _handle_intro(self, state: dict, message: str) -> str:
         """Handle introduction phase"""
@@ -81,7 +74,7 @@ class PMOConsultantBot(fp.PoeBot):
 
 **I need to collect information about your program:**
 1. **Program basics**: Name, manager, sponsor
-2. **Timeline**: Start and end dates
+2. **Timeline**: Start and end dates  
 3. **Budget**: Total budget and amount spent so far
 4. **Status**: Overall status (On Track/At Risk/Off Track) and commentary
 5. **Progress**: Key accomplishments and upcoming milestones
@@ -98,7 +91,7 @@ class PMOConsultantBot(fp.PoeBot):
         
         # Update state with extracted data
         for key, value in extraction_result["extracted_data"].items():
-            if value and value != "unknown" and value != "null":
+            if value and value != "unknown" and value != "null" and value != None:
                 state["data"][key] = value
         
         # Check if we have everything
@@ -178,22 +171,22 @@ class PMOConsultantBot(fp.PoeBot):
 Respond ONLY with valid JSON, no other text."""
 
         try:
-            # Create a query request for Claude with the system prompt
-            claude_query = [
-                fp.ProtocolMessage(role="system", content=system_prompt),
-                fp.ProtocolMessage(role="user", content=message)
-            ]
+            # Get the last user message
+            last_msg = request.query[-1]
+            
+            # Create a new message with the system prompt
+            new_msg = last_msg.model_copy(update={"content": system_prompt})
+            
+            # Create a new request with the modified message
+            new_request = request.model_copy(update={"query": [new_msg]})
             
             # Use Poe's stream_request to call Claude
             extraction_response = ""
-            async for partial in fp.stream_request(
-                request=request,
-                bot_name="Claude-Sonnet-4.5",
-                access_key=request.access_key,
-                query=claude_query
+            async for msg in fp.stream_request(
+                new_request, "Claude-Sonnet-4.5", request.access_key
             ):
-                if isinstance(partial, fp.PartialResponse):
-                    extraction_response += partial.text
+                if isinstance(msg, fp.PartialResponse):
+                    extraction_response += msg.text
             
             # Parse JSON from response
             # Sometimes Claude adds markdown formatting, so clean it
