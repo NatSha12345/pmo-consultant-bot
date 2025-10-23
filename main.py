@@ -92,7 +92,7 @@ Go ahead and tell me what you know!"""
             data["program_manager_email"] = email_match.group(0)
         
         # Extract numbers for RAID counts when explicitly asked
-        current_q = state.get("current_question", "")
+        current_q = state.get("current_question", "") or ""
         
         # Look for standalone numbers (like "0", "5", "10")
         number_match = re.search(r'\b(\d+)\b', message)
