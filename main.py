@@ -1,7 +1,7 @@
 """
 PMO Expert Consultant - AI-Powered Poe Server Bot
 Deployed on Render.com
-Uses Poe's built-in Claude model for AI intelligence
+Uses Poe's Claude-Sonnet-4.5 for AI intelligence
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ conversation_states = {}
 class PMOConsultantBot(fp.PoeBot):
     """
     AI-powered PMO consultant that intelligently collects program information
-    and generates PowerPoint reports using Poe's Claude model
+    and generates PowerPoint reports using Poe's Claude-Sonnet-4.5
     """
 
     async def get_response(
@@ -51,21 +51,23 @@ class PMOConsultantBot(fp.PoeBot):
         # Process based on phase
         if state["phase"] == "intro":
             response = await self._handle_intro(state, user_message)
+            yield fp.PartialResponse(text=response)
         elif state["phase"] == "collecting":
-            response = await self._handle_collection(state, user_message, request)
+            async for partial in self._handle_collection(state, user_message, request):
+                yield partial
         elif state["phase"] == "complete":
             response = await self._handle_completion(state, user_message)
+            yield fp.PartialResponse(text=response)
         else:
             response = "I'm not sure what to do. Let's start over. Type 'hello' to begin."
             state["phase"] = "intro"
+            yield fp.PartialResponse(text=response)
         
-        # Add bot response to history
-        state["conversation_history"].append({
-            "role": "assistant",
-            "content": response
-        })
-        
-        yield fp.PartialResponse(text=response)
+        # Add bot response to history (will be updated after streaming)
+        # state["conversation_history"].append({
+        #     "role": "assistant",
+        #     "content": response
+        # })
 
     async def _handle_intro(self, state: dict, message: str) -> str:
         """Handle introduction phase"""
@@ -88,7 +90,7 @@ class PMOConsultantBot(fp.PoeBot):
 
 **Let's get started! Tell me about your program.** You can share as much or as little as you want, and I'll ask follow-up questions for anything missing."""
 
-    async def _handle_collection(self, state: dict, message: str, request: fp.QueryRequest) -> str:
+    async def _handle_collection(self, state: dict, message: str, request: fp.QueryRequest) -> AsyncIterable[fp.PartialResponse]:
         """Handle data collection phase with AI intelligence using Poe's Claude"""
         
         # Use Poe's Claude to extract information and determine next steps
@@ -114,10 +116,11 @@ class PMOConsultantBot(fp.PoeBot):
         if not missing_fields:
             # All data collected - prepare for submission
             state["phase"] = "complete"
-            return await self._prepare_submission(state)
+            response = await self._prepare_submission(state)
+            yield fp.PartialResponse(text=response)
         else:
             # Still need more information
-            return extraction_result["next_question"]
+            yield fp.PartialResponse(text=extraction_result["next_question"])
 
     async def _extract_data_with_poe_ai(self, state: dict, message: str, request: fp.QueryRequest) -> dict:
         """Use Poe's Claude to intelligently extract data and generate next question"""
@@ -139,19 +142,21 @@ class PMOConsultantBot(fp.PoeBot):
 - program_manager: Full name of program manager
 - program_manager_email: Email address of program manager
 - sponsor_name: Full name of executive sponsor
-- update_date: Current date (YYYY-MM-DD format, use today's date if not specified)
+- update_date: Current date (YYYY-MM-DD format, use today's date: 2024-10-23 if not specified)
 - update_title: Title for this update (e.g., "Q4 2024 Update")
 - key_accomplishments: Recent achievements (string, can be bullet points)
 - upcoming_milestones: Future milestones (string, can be bullet points)
 - total_budget: Total program budget (integer, just the number)
 - budget_spent: Amount spent so far (integer, just the number)
-- schedule_variance: Days ahead/behind schedule (integer, positive or negative)
+- schedule_variance: Days ahead/behind schedule (integer, positive or negative, use 0 if on track)
 - overall_status: "On Track", "At Risk", or "Off Track"
 - status_commentary: Explanation of current status (string)
 - open_risks: Number of open risks (integer)
 - open_assumptions: Number of open assumptions (integer)
 - open_issues: Number of open issues (integer)
 - open_dependencies: Number of open dependencies (integer)
+
+**User's message:** {message}
 
 **Response format (JSON ONLY, no other text):**
 {{
@@ -170,19 +175,25 @@ class PMOConsultantBot(fp.PoeBot):
 - Be encouraging and professional
 - Group related questions together (e.g., ask for all RAID counts at once)
 
-User's message: {message}
-
 Respond ONLY with valid JSON, no other text."""
 
         try:
-            # Use Poe's Claude model via bot query
+            # Create a query request for Claude with the system prompt
+            claude_query = [
+                fp.ProtocolMessage(role="system", content=system_prompt),
+                fp.ProtocolMessage(role="user", content=message)
+            ]
+            
+            # Use Poe's stream_request to call Claude
             extraction_response = ""
-            async for partial in fp.get_bot_response(
-                messages=[fp.ProtocolMessage(role="user", content=system_prompt)],
-                bot_name="Claude-3.5-Sonnet",
-                api_key=request.access_key,
+            async for partial in fp.stream_request(
+                request=request,
+                bot_name="Claude-Sonnet-4.5",
+                access_key=request.access_key,
+                query=claude_query
             ):
-                extraction_response += partial.text
+                if isinstance(partial, fp.PartialResponse):
+                    extraction_response += partial.text
             
             # Parse JSON from response
             # Sometimes Claude adds markdown formatting, so clean it
@@ -200,7 +211,7 @@ Respond ONLY with valid JSON, no other text."""
             
         except Exception as e:
             print(f"AI extraction error: {e}")
-            print(f"Response was: {extraction_response}")
+            print(f"Response was: {extraction_response if 'extraction_response' in locals() else 'No response'}")
             return {
                 "extracted_data": {},
                 "next_question": "I had trouble processing that. Could you please provide some basic information about your program: the program name, your name as program manager, and your email address?"
@@ -304,7 +315,7 @@ Type "hello" to start over."""
     async def get_settings(self, setting: fp.SettingsRequest) -> fp.SettingsResponse:
         """Configure bot settings"""
         return fp.SettingsResponse(
-            server_bot_dependencies={"Claude-3.5-Sonnet": 1},
+            server_bot_dependencies={"Claude-Sonnet-4.5": 1},
             introduction_message="👋 Hi! I'm your AI-powered PMO consultant. I'll help you create a comprehensive program plan and deliver 5 professional PowerPoint reports to your inbox. Just say 'hello' to get started!"
         )
 
