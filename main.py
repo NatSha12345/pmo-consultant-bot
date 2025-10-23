@@ -171,11 +171,14 @@ class PMOConsultantBot(fp.PoeBot):
 Respond ONLY with valid JSON, no other text."""
 
         try:
+            # Create a combined prompt that includes both the system instructions and user message
+            combined_prompt = f"{system_prompt}\n\n**User just said:** {message}"
+            
             # Get the last user message
             last_msg = request.query[-1]
             
-            # Create a new message with the system prompt
-            new_msg = last_msg.model_copy(update={"content": system_prompt})
+            # Create a new message with the combined prompt
+            new_msg = last_msg.model_copy(update={"content": combined_prompt})
             
             # Create a new request with the modified message
             new_request = request.model_copy(update={"query": [new_msg]})
