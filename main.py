@@ -165,7 +165,7 @@ Go ahead and tell me what you know!"""
             "open_risks", "open_assumptions", "open_issues", "open_dependencies"
         ]
         
-        missing_fields = [f for f in required_fields if f not in state["data"] or not state["data"][f]]
+        missing_fields = [f for f in required_fields if f not in state["data"] or state["data"][f] is None or state["data"][f] == ""]
         
         print(f"Current data: {json.dumps(state['data'], indent=2)}")
         print(f"Missing fields: {missing_fields}")
