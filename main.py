@@ -9,6 +9,7 @@ from typing import AsyncIterable
 import fastapi_poe as fp
 import json
 import httpx
+import re
 
 # Webhook endpoint
 WEBHOOK_URL = "https://natsha.pythonanywhere.com/webhook/fortnightly-update-direct"
@@ -65,6 +66,8 @@ class PMOConsultantBot(fp.PoeBot):
     async def _handle_intro(self, state: dict, message: str) -> str:
         """Handle introduction phase"""
         state["phase"] = "collecting"
+        # Set schedule_variance to 0 by default
+        state["data"]["schedule_variance"] = 0
         return """👋 Hi! I'm your AI-powered PMO consultant. I'll help you create a comprehensive program plan and deliver 5 professional PowerPoint reports to your inbox.
 
 **You can provide information in any way you like:**
@@ -89,17 +92,29 @@ class PMOConsultantBot(fp.PoeBot):
         # Use Poe's Claude to extract information and determine next steps
         extraction_result = await self._extract_data_with_poe_ai(state, message, request)
         
-        # Update state with extracted data
-        for key, value in extraction_result["extracted_data"].items():
-            if value and value != "unknown" and value != "null" and value != None:
-                state["data"][key] = value
+        # Update state with extracted data (only non-null values)
+        if extraction_result and "extracted_data" in extraction_result:
+            for key, value in extraction_result["extracted_data"].items():
+                # Only update if value is meaningful
+                if value and str(value).lower() not in ["unknown", "null", "none", ""]:
+                    # Special handling for numeric fields
+                    if key in ["total_budget", "budget_spent", "open_risks", "open_assumptions", "open_issues", "open_dependencies"]:
+                        try:
+                            # Extract numbers from strings
+                            num_str = re.sub(r'[^\d-]', '', str(value))
+                            if num_str:
+                                state["data"][key] = int(num_str)
+                        except:
+                            pass
+                    else:
+                        state["data"][key] = value
         
-        # Check if we have everything
+        # Check if we have everything (schedule_variance is already set to 0)
         required_fields = [
             "program_name", "program_manager", "program_manager_email",
             "sponsor_name", "update_date", "update_title",
             "key_accomplishments", "upcoming_milestones",
-            "total_budget", "budget_spent", "schedule_variance",
+            "total_budget", "budget_spent",
             "overall_status", "status_commentary",
             "open_risks", "open_assumptions", "open_issues", "open_dependencies"
         ]
@@ -113,74 +128,73 @@ class PMOConsultantBot(fp.PoeBot):
             yield fp.PartialResponse(text=response)
         else:
             # Still need more information
-            yield fp.PartialResponse(text=extraction_result["next_question"])
+            next_q = extraction_result.get("next_question", "Could you provide more details about your program?")
+            yield fp.PartialResponse(text=next_q)
 
     async def _extract_data_with_poe_ai(self, state: dict, message: str, request: fp.QueryRequest) -> dict:
         """Use Poe's Claude to intelligently extract data and generate next question"""
         
         current_data = state["data"]
         
-        system_prompt = f"""You are a PMO consultant collecting program information. 
+        system_prompt = f"""You are a PMO consultant collecting program information. Extract data from the user's message and ask for what's missing.
 
 **Current data collected:**
 {json.dumps(current_data, indent=2)}
 
-**Your tasks:**
-1. Extract any new information from the user's message
-2. Determine what's still missing
-3. Generate a natural follow-up question
-
-**Required fields:**
+**Required fields (extract from user's message if present):**
 - program_name: Name of the program
 - program_manager: Full name of program manager
-- program_manager_email: Email address of program manager
-- sponsor_name: Full name of executive sponsor
-- update_date: Current date (YYYY-MM-DD format, use today's date: 2024-10-23 if not specified)
-- update_title: Title for this update (e.g., "Q4 2024 Update")
-- key_accomplishments: Recent achievements (string, can be bullet points)
-- upcoming_milestones: Future milestones (string, can be bullet points)
-- total_budget: Total program budget (integer, just the number)
-- budget_spent: Amount spent so far (integer, just the number)
-- schedule_variance: Days ahead/behind schedule (integer, positive or negative, use 0 if on track)
-- overall_status: "On Track", "At Risk", or "Off Track"
-- status_commentary: Explanation of current status (string)
-- open_risks: Number of open risks (integer)
-- open_assumptions: Number of open assumptions (integer)
-- open_issues: Number of open issues (integer)
-- open_dependencies: Number of open dependencies (integer)
+- program_manager_email: Email address
+- sponsor_name: Executive sponsor name
+- update_date: Date (YYYY-MM-DD format, use 2024-10-23 if not specified)
+- update_title: Update title (e.g., "Q4 2024 Update")
+- key_accomplishments: Recent achievements
+- upcoming_milestones: Future milestones
+- total_budget: Total budget (integer only, no currency symbols)
+- budget_spent: Amount spent (integer only)
+- overall_status: Must be exactly "On Track", "At Risk", or "Off Track"
+- status_commentary: Status explanation
+- open_risks: Number of open risks (integer, use 0 if "none" or "no risks")
+- open_assumptions: Number of assumptions (integer, use 0 if none)
+- open_issues: Number of issues (integer, use 0 if none)
+- open_dependencies: Number of dependencies (integer, use 0 if none)
 
-**User's message:** {message}
+**User's message:** "{message}"
 
-**Response format (JSON ONLY, no other text):**
+**Your task:**
+1. Extract ANY information from the user's message
+2. Identify what's still missing
+3. Ask a natural follow-up question for missing items
+
+**Response format - MUST be valid JSON:**
 {{
   "extracted_data": {{
-    "field_name": "extracted_value or null if not found"
+    "field_name": "value"
   }},
-  "next_question": "Natural follow-up question asking for missing information. Be conversational and helpful. Acknowledge what they've provided. If many fields are missing, ask for 2-3 related items at once."
+  "next_question": "Your follow-up question here"
 }}
 
-**Guidelines:**
-- Extract as much as possible from the user's message
-- For budget: extract just the number (e.g., "500000" from "$500,000")
-- For dates: convert to YYYY-MM-DD format
-- For RAID counts: if user says "no risks" or "none", set to 0
-- If user provides general info, make reasonable assumptions (e.g., if they say "just started", budget_spent could be low)
-- Be encouraging and professional
-- Group related questions together (e.g., ask for all RAID counts at once)
+**Important rules:**
+- For numbers: extract digits only (e.g., "500000" from "$500,000" or "500k")
+- For RAID counts: if user says "none", "no", "zero" → use 0
+- If user says "on track" or "on schedule" → overall_status is "On Track"
+- Be encouraging and conversational
+- Ask for 2-3 related items at once
+- ONLY return valid JSON, no other text
 
-Respond ONLY with valid JSON, no other text."""
+Return JSON now:"""
 
         try:
-            # Create a combined prompt that includes both the system instructions and user message
-            combined_prompt = f"{system_prompt}\n\n**User just said:** {message}"
+            # Create a combined prompt
+            combined_prompt = f"{system_prompt}"
             
             # Get the last user message
             last_msg = request.query[-1]
             
-            # Create a new message with the combined prompt
+            # Create a new message with the prompt
             new_msg = last_msg.model_copy(update={"content": combined_prompt})
             
-            # Create a new request with the modified message
+            # Create a new request
             new_request = request.model_copy(update={"query": [new_msg]})
             
             # Use Poe's stream_request to call Claude
@@ -191,26 +205,26 @@ Respond ONLY with valid JSON, no other text."""
                 if isinstance(msg, fp.PartialResponse):
                     extraction_response += msg.text
             
-            # Parse JSON from response
-            # Sometimes Claude adds markdown formatting, so clean it
+            # Clean up the response
             extraction_response = extraction_response.strip()
-            if extraction_response.startswith("```json"):
-                extraction_response = extraction_response[7:]
-            if extraction_response.startswith("```"):
-                extraction_response = extraction_response[3:]
-            if extraction_response.endswith("```"):
-                extraction_response = extraction_response[:-3]
+            # Remove markdown code blocks if present
+            if "```json" in extraction_response:
+                extraction_response = extraction_response.split("```json")[1].split("```")[0]
+            elif "```" in extraction_response:
+                extraction_response = extraction_response.split("```")[1].split("```")[0]
             extraction_response = extraction_response.strip()
             
+            # Try to parse JSON
             result = json.loads(extraction_response)
             return result
             
         except Exception as e:
             print(f"AI extraction error: {e}")
             print(f"Response was: {extraction_response if 'extraction_response' in locals() else 'No response'}")
+            # Fallback: ask for basic info
             return {
                 "extracted_data": {},
-                "next_question": "I had trouble processing that. Could you please provide some basic information about your program: the program name, your name as program manager, and your email address?"
+                "next_question": "I had trouble processing that. Could you please provide: your program name, your name as program manager, and your email address?"
             }
 
     async def _handle_completion(self, state: dict, message: str) -> str:
@@ -238,7 +252,7 @@ Respond ONLY with valid JSON, no other text."""
             "upcoming_milestones": data.get("upcoming_milestones", "None reported"),
             "total_budget": int(data.get("total_budget", 0)) if str(data.get("total_budget", 0)).replace("-","").isdigit() else 0,
             "budget_spent": int(data.get("budget_spent", 0)) if str(data.get("budget_spent", 0)).replace("-","").isdigit() else 0,
-            "schedule_variance": int(data.get("schedule_variance", 0)) if str(data.get("schedule_variance", 0)).replace("-","").isdigit() else 0,
+            "schedule_variance": 0,  # Always 0 - field removed from collection
             "overall_status": data.get("overall_status", "On Track"),
             "status_commentary": data.get("status_commentary", "No commentary provided"),
             "raid_counts": {
